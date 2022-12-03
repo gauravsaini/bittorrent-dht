@@ -15,6 +15,9 @@ const BUCKET_OUTDATED_TIMESPAN = 15 * 60 * 1000 // check nodes in bucket in 15 m
 class DHT extends EventEmitter {
   constructor (opts = {}) {
     super()
+    // Set the value of K to 1 to support the BEP 50 specification
+    this._k = 1
+    this._topicSubscriptions = new Map();
 
     this._tables = new LRU({ maxAge: ROTATE_INTERVAL, max: opts.maxTables || 1000 })
     this._values = new LRU(opts.maxValues || 1000)
@@ -75,6 +78,22 @@ class DHT extends EventEmitter {
         self._debug('no node added, all other nodes ok')
         cb()
       })
+    }
+    function publish(topic, message) {
+      // Check if the topic exists in the map
+      if (!self._topicSubscriptions.has(topic)) {
+        // If not, return error
+        return new Error(`Topic ${topic} does not exist`);
+      }
+  
+      // Get the array of subscribed nodes for the topic
+      const nodes = self._topicSubscriptions.get(topic);
+  
+      // Iterate through the array of nodes
+      for (const node of nodes) {
+        // Send the message to each node
+        self._sendMessage(node, message);
+      }
     }
 
     function onlistening () {
