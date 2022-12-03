@@ -18,7 +18,10 @@ class DHT extends EventEmitter {
     // Set the value of K to 1 to support the BEP 50 specification
     this._k = 1
     this._topicSubscriptions = new Map();
-
+    this._topicMessages = new Map();
+    // Increase the capacity of the home bucket and its sibling to 8
+    this._homeBucketCapacity = 8;
+    this._siblingBucketCapacity = 8;
     this._tables = new LRU({ maxAge: ROTATE_INTERVAL, max: opts.maxTables || 1000 })
     this._values = new LRU(opts.maxValues || 1000)
     this._peers = records({
@@ -125,6 +128,21 @@ class DHT extends EventEmitter {
         // Send the message to each node
         self._sendMessage(node, message);
       }
+    }
+
+    function isValidUpdate(message) {
+      // Check if the query is valid per BEP 44
+      if (!isValidBep44Query(message)) {
+        return false;
+      }
+    
+      // Check if the value has a sequence number greater than the client's currently stored value
+      if (message.seq <= self._values.get(message.target)) {
+        return false;
+      }
+    
+      // If the query is valid per BEP 44 and the value has a higher sequence number, return true
+      return true;
     }
 
     function onlistening () {
@@ -302,75 +320,58 @@ class DHT extends EventEmitter {
     }
   }
 
-  put (opts, cb) {
-    if (Buffer.isBuffer(opts) || typeof opts === 'string') opts = { v: opts }
-    const isMutable = !!opts.k
-    if (opts.v === undefined) {
-      throw new Error('opts.v not given')
-    }
-    if (opts.v.length >= 1000) {
-      throw new Error('v must be less than 1000 bytes in put()')
-    }
-    if (isMutable && opts.cas !== undefined && typeof opts.cas !== 'number') {
-      throw new Error('opts.cas must be an integer if provided')
-    }
-    if (isMutable && opts.k.length !== 32) {
-      throw new Error('opts.k ed25519 public key must be 32 bytes')
-    }
-    if (isMutable && typeof opts.sign !== 'function' && !Buffer.isBuffer(opts.sig)) {
-      throw new Error('opts.sign function or options.sig signature is required for mutable put')
-    }
-    if (isMutable && opts.salt && opts.salt.length > 64) {
-      throw new Error('opts.salt is > 64 bytes long')
-    }
-    if (isMutable && opts.seq === undefined) {
-      throw new Error('opts.seq not provided for a mutable update')
-    }
-    if (isMutable && typeof opts.seq !== 'number') {
-      throw new Error('opts.seq not an integer')
-    }
+  _forwardUpdate(topic, message) {
+    // Get the nodes subscribed to the topic
+    const nodes = this._rpc.nodes(topic);
 
-    return this._put(opts, cb)
+    // Loop through the nodes
+    for (const node of nodes) {
+      // Send the update to the node
+      this._rpc.put(node, topic, message);
+    }
   }
 
-  _put (opts, cb) {
-    if (!cb) cb = noop
+  joinTopic(topic) {
+    // Add the node to the routing table for the topic
+    this._rpc.add(topic);
+  }
 
-    const isMutable = !!opts.k
-    const v = typeof opts.v === 'string' ? Buffer.from(opts.v) : opts.v
-    const key = isMutable
-      ? this._hash(opts.salt ? Buffer.concat([opts.k, opts.salt]) : opts.k)
-      : this._hash(bencode.encode(v))
+  leaveTopic(topic) {
+    // Remove the node from the routing table for the topic
+    this._rpc.remove(topic);
+  }
 
-    const table = this._tables.get(key.toString('hex'))
-    if (!table) return this._preput(key, opts, cb)
+  put(topic, message) {
+    // Check if the topic exists in the map
+    if (!this._topicMessages.has(topic)) {
+      // If not, add the topic to the map with an empty array
+      this._topicMessages.set(topic, []);
 
-    const message = {
-      q: 'put',
-      a: {
-        id: this._rpc.id,
-        token: null, // queryAll sets this
-        v
-      }
+       // Check if the put query contains a valid update
+    if (isValidUpdate(message)) {
+      // If it does, forward the update to all nodes subscribed to the topic
+      this._forwardUpdate(topic, message);
     }
 
-    if (isMutable) {
-      if (typeof opts.cas === 'number') message.a.cas = opts.cas
-      if (opts.salt) message.a.salt = opts.salt
-      message.a.k = opts.k
-      message.a.seq = opts.seq
-      if (typeof opts.sign === 'function') message.a.sig = opts.sign(encodeSigData(message.a))
-      else if (Buffer.isBuffer(opts.sig)) message.a.sig = opts.sig
-    } else {
-      this._values.set(key.toString('hex'), message.a)
+    // Get the array of messages for the topic
+    const messages = this._topicMessages.get(topic);
+
+    // Add the message to the array of messages
+    messages.push(message);
+  }
+
+  get(topic) {
+    // Check if the topic exists in the map
+    if (!this._topicMessages.has(topic)) {
+      // If not, return error
+      return new Error(`Topic ${topic} does not exist`);
     }
 
-    this._rpc.queryAll(table.closest(key), message, null, (err, n) => {
-      if (err) return cb(err, key, n)
-      cb(null, key, n)
-    })
+    // Get the array of messages for the topic
+    const messages = this._topicMessages.get(topic);
 
-    return key
+    // Return the array of messages
+    return messages
   }
 
   _preput (key, opts, cb) {
@@ -476,6 +477,28 @@ class DHT extends EventEmitter {
     this._debug('announce %s %d', infoHash, port)
     this._rpc.queryAll(table.closest(infoHash), message, null, cb)
   }
+  get_peers(query) {
+    // Check if the node is joining or leaving a topic
+    if (query.action === 'join') {
+      // If it is, join the topic
+      this.joinTopic(query.target);
+    } else if (query.action === 'leave') {
+      // If it is, leave the topic
+      this.leaveTopic(query.target);
+    }
+
+    // Handle the get_peers query as usual
+    const target = query.a.target
+    const token = randombytes(4)
+    const nodes = this.nodes(target)
+    const response = {
+      id: this.nodeId,
+      nodes,
+      token
+    }
+
+    this._rpc.response(query, response)
+  }
 
   _preannounce (infoHash, port, cb) {
     const self = this
@@ -551,19 +574,17 @@ class DHT extends EventEmitter {
     const q = query.q.toString()
     this._debug('received %s query from %s:%d', q, peer.address, peer.port)
     if (!query.a) return
-
+    // Check if the query is a get_peers or announce_peer query
+    if (q === 'get_peers' || q === 'announce_peer') {
+      // If it is, return an error
+      return new Error('get_peers and announce_peer queries are prohibited');
+    }
     switch (q) {
       case 'ping':
         return this._rpc.response(peer, query, { id: this._rpc.id })
 
       case 'find_node':
         return this._onfindnode(query, peer)
-
-      case 'get_peers':
-        return this._ongetpeers(query, peer)
-
-      case 'announce_peer':
-        return this._onannouncepeer(query, peer)
 
       case 'get':
         return this._onget(query, peer)
