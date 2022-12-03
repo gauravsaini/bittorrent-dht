@@ -79,6 +79,19 @@ class DHT extends EventEmitter {
         cb()
       })
     }
+    function subscribe(topic, nodeId) {
+      // Check if the topic exists in the map
+      if (!self._topicSubscriptions.has(topic)) {
+        // If not, add the topic to the map with an empty array
+        self._topicSubscriptions.set(topic, []);
+      }
+  
+      // Get the array of subscribed nodes for the topic
+      const nodes = self._topicSubscriptions.get(topic);
+  
+      // Add the node to the array of subscribed nodes
+      nodes.push(nodeId);
+    }
 
     function get(topic) {
       // Check if the topic exists in the map
